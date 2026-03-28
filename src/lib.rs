@@ -9,16 +9,23 @@ use serde_json::Value as JsonValue;
 use tantivy::collector::TopDocs;
 use tantivy::query::{EnableScoring, QueryParser};
 use tantivy::schema::{FAST, INDEXED, STORED, STRING, Schema, TEXT, TantivyDocument, Value};
-use tantivy::{Index, IndexWriter, ReloadPolicy, doc};
 use tantivy::{DocAddress, DocSet, TERMINATED};
+use tantivy::{Index, IndexWriter, ReloadPolicy, doc};
 use walkdir::WalkDir;
 use zstd::stream::read::Decoder;
 
-#[derive(Copy, Clone, Debug, Deserialize, Serialize, ValueEnum)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum InputKind {
     Post,
     Comment,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoveredIndex {
+    pub path: PathBuf,
+    pub kind_hint: Option<InputKind>,
+    pub year_month: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +150,43 @@ pub fn discover_input_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+pub fn discover_indexes(index_root: &Path) -> Result<Vec<DiscoveredIndex>> {
+    if !index_root.is_dir() {
+        bail!("index root not found: {}", index_root.display());
+    }
+
+    let mut indexes = Vec::new();
+    for entry in std::fs::read_dir(index_root)
+        .with_context(|| format!("read index root {}", index_root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if Index::open_in_dir(&path).is_err() {
+            continue;
+        }
+
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        indexes.push(DiscoveredIndex {
+            path,
+            kind_hint: infer_kind_from_index_name(&name),
+            year_month: infer_year_month_from_index_name(&name),
+        });
+    }
+
+    indexes.sort_by(|left, right| left.path.cmp(&right.path));
+    if indexes.is_empty() {
+        bail!("no tantivy indexes found under {}", index_root.display());
+    }
+    Ok(indexes)
+}
+
 pub fn resolve_reddit_archive(root: &Path, kind: InputKind, year_month: &str) -> Result<PathBuf> {
     if !valid_year_month(year_month) {
         bail!("invalid --year-month format: {year_month}; expected YYYY-MM");
@@ -210,32 +254,6 @@ pub fn resolve_index_dir(
         .unwrap_or_else(|| "archive".to_string());
 
     Ok(index_root.join(format!("{}-{}", kind.as_str(), base_name)))
-}
-
-pub fn resolve_search_index_dir(
-    index_dir: Option<PathBuf>,
-    index_root: Option<PathBuf>,
-    kind: Option<InputKind>,
-    year_month: Option<&str>,
-) -> Result<PathBuf> {
-    if let Some(index_dir) = index_dir {
-        return Ok(index_dir);
-    }
-
-    let (kind, year_month) = match (kind, year_month) {
-        (Some(kind), Some(year_month)) => (kind, year_month),
-        _ => bail!("search requires either index_dir or both index_root, kind, and year_month"),
-    };
-    if !valid_year_month(year_month) {
-        bail!("invalid year_month format: {year_month}; expected YYYY-MM");
-    }
-
-    let index_root = index_root.unwrap_or_else(|| PathBuf::from("./tantivy-indexes"));
-    let file_stem = match kind {
-        InputKind::Post => format!("RS_{year_month}"),
-        InputKind::Comment => format!("RC_{year_month}"),
-    };
-    Ok(index_root.join(format!("{}-{}", kind.as_str(), file_stem)))
 }
 
 pub fn index_file(
@@ -488,6 +506,35 @@ fn strip_all_extensions(file_name: &str) -> String {
         out = stem.to_string();
     }
     out
+}
+
+fn infer_kind_from_index_name(name: &str) -> Option<InputKind> {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("comment") || name.contains("RC_") {
+        return Some(InputKind::Comment);
+    }
+    if lower.contains("submission") || lower.contains("post") || name.contains("RS_") {
+        return Some(InputKind::Post);
+    }
+    None
+}
+
+fn infer_year_month_from_index_name(name: &str) -> Option<String> {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() < 7 {
+        return None;
+    }
+
+    for start in 0..=chars.len() - 7 {
+        let slice = &chars[start..start + 7];
+        if slice[0..4].iter().all(|c| c.is_ascii_digit())
+            && slice[4] == '-'
+            && slice[5..7].iter().all(|c| c.is_ascii_digit())
+        {
+            return Some(slice.iter().collect());
+        }
+    }
+    None
 }
 
 impl InputKind {

@@ -6,15 +6,15 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Args, Parser, Subcommand};
 use feedgrep_search::{
-    InputKind, build_schema, discover_input_files, index_file, open_or_create_index,
-    resolve_index_dir, resolve_kind, resolve_reddit_archive, search_index, stream_index_hits,
-    truncate,
+    DiscoveredIndex, InputKind, build_schema, discover_indexes, discover_input_files, index_file,
+    open_or_create_index, resolve_index_dir, resolve_kind, resolve_reddit_archive, search_index,
+    stream_index_hits, truncate,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -69,20 +69,20 @@ struct IndexArgs {
 
 #[derive(Args, Debug)]
 struct SearchArgs {
-    #[arg(long, conflicts_with = "index_root")]
+    #[arg(long)]
     index_dir: Option<PathBuf>,
 
-    #[arg(long, conflicts_with = "index_dir")]
+    #[arg(long)]
     index_root: Option<PathBuf>,
 
-    #[arg(long, requires = "year_month")]
+    #[arg(long, value_enum)]
     kind: Option<InputKind>,
-
-    #[arg(long, requires = "kind")]
-    year_month: Option<String>,
 
     #[arg(long, default_value_t = 10)]
     limit: usize,
+
+    #[arg(long)]
+    min_score: Option<f32>,
 
     query: String,
 }
@@ -92,13 +92,13 @@ struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:4001")]
     listen_addr: SocketAddr,
 
-    #[arg(long, default_value = "./indexes.json")]
-    indexes_config: PathBuf,
+    #[arg(long, default_value = "./tantivy-indexes")]
+    index_root: PathBuf,
 }
 
 #[derive(Clone)]
 struct AppState {
-    indexes: IndexManifest,
+    indexes: Vec<DiscoveredIndex>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,19 +133,6 @@ struct HealthResponse {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct IndexManifest {
-    indexes: Vec<IndexEntry>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct IndexEntry {
-    kind: InputKind,
-    year_month: String,
-    path: PathBuf,
 }
 
 struct ApiError(anyhow::Error);
@@ -200,17 +187,43 @@ fn run_index(args: IndexArgs) -> Result<()> {
 }
 
 fn run_search(args: SearchArgs) -> Result<()> {
-    let index_dir = match args.index_dir {
-        Some(path) => path,
-        None => resolve_cli_search_index_dir(args.index_root, args.kind, args.year_month.as_deref())?,
+    let limit = sanitize_limit(Some(args.limit)).map_err(|err| err.0)?;
+    let min_score = sanitize_min_score(args.min_score).map_err(|err| err.0)?;
+
+    let mut hits = if let Some(index_dir) = args.index_dir {
+        search_index(&index_dir, &args.query, limit, None)?
+    } else {
+        let index_root = args.index_root.unwrap_or_else(|| PathBuf::from("./tantivy-indexes"));
+        let mut merged = Vec::new();
+        for entry in discover_indexes(&index_root)? {
+            if !index_matches_kind(&entry, args.kind) {
+                continue;
+            }
+            merged.extend(search_index(&entry.path, &args.query, limit, entry.year_month.as_deref())?);
+        }
+        merged
     };
-    let hits = search_index(&index_dir, &args.query, args.limit, args.year_month.as_deref())?;
+
+    hits.retain(|hit| hit.score >= min_score && hit_matches_kind(hit, args.kind));
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(limit);
+    for (idx, hit) in hits.iter_mut().enumerate() {
+        hit.rank = idx + 1;
+    }
 
     for hit in hits {
         println!("rank={}", hit.rank);
         println!("score={}", hit.score);
         println!("id={}", hit.id);
         println!("kind={}", hit.kind);
+        if let Some(year_month) = &hit.year_month {
+            println!("year_month={}", year_month);
+        }
         println!("subreddit={}", hit.subreddit);
         println!("author={}", hit.author);
         println!("created_at={}", hit.created_at);
@@ -223,10 +236,8 @@ fn run_search(args: SearchArgs) -> Result<()> {
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
-    let indexes = load_indexes_config(&args.indexes_config)?;
-    let app_state = Arc::new(AppState {
-        indexes,
-    });
+    let indexes = discover_indexes(&args.index_root)?;
+    let app_state = Arc::new(AppState { indexes });
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -237,7 +248,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(args.listen_addr)
         .await
         .with_context(|| format!("bind {}", args.listen_addr))?;
-    println!("listening addr={}", args.listen_addr);
+    println!("listening addr={} index_root={}", args.listen_addr, args.index_root.display());
     axum::serve(listener, app).await.context("serve axum")?;
     Ok(())
 }
@@ -258,14 +269,14 @@ async fn search(
     for entry in matching_indexes(&state, request.kind)? {
         searched_indexes += 1;
         hits.extend(
-            search_index(&entry.path, &request.query, limit, Some(&entry.year_month))?
+            search_index(&entry.path, &request.query, limit, entry.year_month.as_deref())?
                 .into_iter()
-                .filter(|hit| hit.score >= min_score),
+                .filter(|hit| hit.score >= min_score && hit_matches_kind(hit, request.kind)),
         );
     }
 
     if searched_indexes == 0 {
-        return Err(ApiError(anyhow::anyhow!("no configured indexes matched the request")));
+        return Err(ApiError(anyhow::anyhow!("no discovered indexes matched the request")));
     }
 
     hits.sort_by(|left, right| {
@@ -291,6 +302,7 @@ async fn stream(
     Json(request): Json<SearchRequest>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let indexes = matching_indexes(&state, request.kind)?;
+    let kind = request.kind;
     let min_score = sanitize_min_score(request.min_score)?;
     let query = request.query;
     let (sender, receiver) = mpsc::channel::<StreamEnvelope>(32);
@@ -301,8 +313,8 @@ async fn stream(
 
         for entry in indexes {
             searched_indexes += 1;
-            let send_result = stream_index_hits(&entry.path, &query, Some(&entry.year_month), |mut hit| {
-                if hit.score >= min_score {
+            let send_result = stream_index_hits(&entry.path, &query, entry.year_month.as_deref(), |mut hit| {
+                if hit.score >= min_score && hit_matches_kind(&hit, kind) {
                     hit_count += 1;
                     hit.rank = hit_count;
                     sender
@@ -381,47 +393,31 @@ fn resolve_inputs(args: &IndexArgs) -> Result<Vec<PathBuf>> {
     discover_input_files(&args.inputs)
 }
 
-fn load_indexes_config(path: &PathBuf) -> Result<IndexManifest> {
-    let raw = std::fs::read_to_string(path).with_context(|| format!("read indexes config {}", path.display()))?;
-    let manifest: IndexManifest =
-        serde_json::from_str(&raw).with_context(|| format!("parse indexes config {}", path.display()))?;
-    if manifest.indexes.is_empty() {
-        bail!("indexes config {} contains no indexes", path.display());
-    }
-    Ok(manifest)
-}
-
-fn matching_indexes(state: &AppState, kind: Option<InputKind>) -> Result<Vec<IndexEntry>, ApiError> {
-    let indexes: Vec<IndexEntry> = state
-        .indexes
+fn matching_indexes(state: &AppState, kind: Option<InputKind>) -> Result<Vec<DiscoveredIndex>, ApiError> {
+    let indexes: Vec<DiscoveredIndex> = state
         .indexes
         .iter()
-        .filter(|entry| kind.is_none_or(|kind| entry.kind.as_str() == kind.as_str()))
+        .filter(|entry| index_matches_kind(entry, kind))
         .cloned()
         .collect();
 
     if indexes.is_empty() {
-        return Err(ApiError(anyhow::anyhow!("no configured indexes matched the request")));
+        return Err(ApiError(anyhow::anyhow!("no discovered indexes matched the request")));
     }
 
     Ok(indexes)
 }
 
-fn resolve_cli_search_index_dir(
-    index_root: Option<PathBuf>,
-    kind: Option<InputKind>,
-    year_month: Option<&str>,
-) -> Result<PathBuf> {
-    let (kind, year_month) = match (kind, year_month) {
-        (Some(kind), Some(year_month)) => (kind, year_month),
-        _ => bail!("search requires either --index-dir or both --index-root, --kind, and --year-month"),
-    };
-    let index_root = index_root.unwrap_or_else(|| PathBuf::from("./tantivy-indexes"));
-    let suffix = match kind {
-        InputKind::Post => format!("RS_{year_month}"),
-        InputKind::Comment => format!("RC_{year_month}"),
-    };
-    Ok(index_root.join(format!("{}-{}", kind.as_str(), suffix)))
+fn index_matches_kind(entry: &DiscoveredIndex, kind: Option<InputKind>) -> bool {
+    match (kind, entry.kind_hint) {
+        (None, _) => true,
+        (Some(kind), Some(hint)) => hint == kind,
+        (Some(_), None) => true,
+    }
+}
+
+fn hit_matches_kind(hit: &feedgrep_search::SearchHit, kind: Option<InputKind>) -> bool {
+    kind.is_none_or(|kind| hit.kind == kind.as_str())
 }
 
 impl IntoResponse for ApiError {
