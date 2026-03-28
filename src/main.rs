@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,17 +7,23 @@ use anyhow::{Context, Result, bail};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Args, Parser, Subcommand};
 use feedgrep_search::{
     InputKind, build_schema, discover_input_files, index_file, open_or_create_index,
-    resolve_index_dir, resolve_kind, resolve_reddit_archive, search_index, truncate,
+    resolve_index_dir, resolve_kind, resolve_reddit_archive, search_index, stream_index_hits,
+    truncate,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 1_000;
+const DEFAULT_MIN_SCORE: f32 = 10.0;
 
 #[derive(Parser, Debug)]
 #[command(name = "feedgrep-search")]
@@ -100,6 +107,7 @@ struct SearchRequest {
     kind: Option<InputKind>,
     query: String,
     limit: Option<usize>,
+    min_score: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,6 +116,13 @@ struct SearchResponse {
     searched_indexes: usize,
     hit_count: usize,
     hits: Vec<feedgrep_search::SearchHit>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamEnd {
+    searched_indexes: usize,
+    hit_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,6 +231,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/search", post(search))
+        .route("/stream", post(stream))
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(args.listen_addr)
@@ -235,22 +251,17 @@ async fn search(
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, ApiError> {
     let limit = sanitize_limit(request.limit)?;
+    let min_score = sanitize_min_score(request.min_score)?;
     let mut hits = Vec::new();
     let mut searched_indexes = 0usize;
 
-    for entry in state
-        .indexes
-        .indexes
-        .iter()
-        .filter(|entry| request.kind.is_none_or(|kind| entry.kind.as_str() == kind.as_str()))
-    {
+    for entry in matching_indexes(&state, request.kind)? {
         searched_indexes += 1;
-        hits.extend(search_index(
-            &entry.path,
-            &request.query,
-            limit,
-            Some(&entry.year_month),
-        )?);
+        hits.extend(
+            search_index(&entry.path, &request.query, limit, Some(&entry.year_month))?
+                .into_iter()
+                .filter(|hit| hit.score >= min_score),
+        );
     }
 
     if searched_indexes == 0 {
@@ -275,6 +286,62 @@ async fn search(
     }))
 }
 
+async fn stream(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SearchRequest>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let indexes = matching_indexes(&state, request.kind)?;
+    let min_score = sanitize_min_score(request.min_score)?;
+    let query = request.query;
+    let (sender, receiver) = mpsc::channel::<StreamEnvelope>(32);
+
+    tokio::task::spawn_blocking(move || {
+        let mut searched_indexes = 0usize;
+        let mut hit_count = 0usize;
+
+        for entry in indexes {
+            searched_indexes += 1;
+            let send_result = stream_index_hits(&entry.path, &query, Some(&entry.year_month), |mut hit| {
+                if hit.score >= min_score {
+                    hit_count += 1;
+                    hit.rank = hit_count;
+                    sender
+                        .blocking_send(StreamEnvelope::Hit(hit))
+                        .map_err(|_| anyhow::anyhow!("stream receiver dropped"))?;
+                }
+                Ok(())
+            });
+
+            if let Err(err) = send_result {
+                let _ = sender.blocking_send(StreamEnvelope::Error(err.to_string()));
+                return;
+            }
+        }
+
+        let _ = sender.blocking_send(StreamEnvelope::End(StreamEnd {
+            searched_indexes,
+            hit_count,
+        }));
+    });
+
+    let stream = ReceiverStream::new(receiver).map(|message| {
+        let event = match message {
+            StreamEnvelope::Hit(hit) => Event::default()
+                .event("hit")
+                .json_data(hit)
+                .expect("serialize hit event"),
+            StreamEnvelope::End(summary) => Event::default()
+                .event("end")
+                .json_data(summary)
+                .expect("serialize end event"),
+            StreamEnvelope::Error(error) => Event::default().event("error").data(error),
+        };
+        Ok(event)
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
 fn sanitize_limit(limit: Option<usize>) -> Result<usize, ApiError> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
     if limit == 0 {
@@ -288,6 +355,14 @@ fn sanitize_limit(limit: Option<usize>) -> Result<usize, ApiError> {
         )));
     }
     Ok(limit)
+}
+
+fn sanitize_min_score(min_score: Option<f32>) -> Result<f32, ApiError> {
+    let min_score = min_score.unwrap_or(DEFAULT_MIN_SCORE);
+    if !min_score.is_finite() {
+        return Err(ApiError(anyhow::anyhow!("minScore must be a finite number")));
+    }
+    Ok(min_score)
 }
 
 fn resolve_inputs(args: &IndexArgs) -> Result<Vec<PathBuf>> {
@@ -314,6 +389,22 @@ fn load_indexes_config(path: &PathBuf) -> Result<IndexManifest> {
         bail!("indexes config {} contains no indexes", path.display());
     }
     Ok(manifest)
+}
+
+fn matching_indexes(state: &AppState, kind: Option<InputKind>) -> Result<Vec<IndexEntry>, ApiError> {
+    let indexes: Vec<IndexEntry> = state
+        .indexes
+        .indexes
+        .iter()
+        .filter(|entry| kind.is_none_or(|kind| entry.kind.as_str() == kind.as_str()))
+        .cloned()
+        .collect();
+
+    if indexes.is_empty() {
+        return Err(ApiError(anyhow::anyhow!("no configured indexes matched the request")));
+    }
+
+    Ok(indexes)
 }
 
 fn resolve_cli_search_index_dir(
@@ -349,4 +440,10 @@ where
     fn from(error: E) -> Self {
         Self(error.into())
     }
+}
+
+enum StreamEnvelope {
+    Hit(feedgrep_search::SearchHit),
+    End(StreamEnd),
+    Error(String),
 }

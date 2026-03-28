@@ -3,7 +3,7 @@
     {
       "kind": "comment",
       "yearMonth": "2025-12",
-      "path": "/home/roko/reddit-indexes/feedgrep-comments-index-sample"
+      "path": "/home/roko/reddit-indexes/comment-RC_2025-12"
     },
     {
       "kind": "comment",
@@ -18,17 +18,17 @@
     {
       "kind": "post",
       "yearMonth": "2025-12",
-      "path": "/home/roko/reddit-indexes/feedgrep-submissions-index-12"
+      "path": "/home/roko/reddit-indexes/post-RS_2025-12"
     },
     {
       "kind": "post",
       "yearMonth": "2026-01",
-      "path": "/home/roko/reddit-indexes/feedgrep-submissions-index-01"
+      "path": "/home/roko/reddit-indexes/post-RS_2026-01"
     },
     {
       "kind": "post",
       "yearMonth": "2026-02",
-      "path": "/home/roko/reddit-indexes/feedgrep-submissions-index-02"
+      "path": "/home/roko/reddit-indexes/post-RS_2026-02"
     }
   ]
 }

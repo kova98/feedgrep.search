@@ -7,9 +7,10 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{EnableScoring, QueryParser};
 use tantivy::schema::{FAST, INDEXED, STORED, STRING, Schema, TEXT, TantivyDocument, Value};
 use tantivy::{Index, IndexWriter, ReloadPolicy, doc};
+use tantivy::{DocAddress, DocSet, TERMINATED};
 use walkdir::WalkDir;
 use zstd::stream::read::Decoder;
 
@@ -401,6 +402,63 @@ pub fn search_index(
     }
 
     Ok(hits)
+}
+
+pub fn stream_index_hits<F>(
+    index_dir: &Path,
+    query_text: &str,
+    year_month: Option<&str>,
+    mut on_hit: F,
+) -> Result<usize>
+where
+    F: FnMut(SearchHit) -> Result<()>,
+{
+    let index = Index::open_in_dir(index_dir)
+        .with_context(|| format!("open tantivy index {}", index_dir.display()))?;
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()
+        .context("create tantivy reader")?;
+    let searcher = reader.searcher();
+    let fields = fields_from_schema(&index.schema())?;
+
+    let query_parser = QueryParser::for_index(
+        &index,
+        vec![fields.title, fields.body, fields.combined_text, fields.subreddit],
+    );
+    let query = query_parser
+        .parse_query(query_text)
+        .with_context(|| format!("parse query {query_text}"))?;
+    let weight = query
+        .weight(EnableScoring::enabled_from_searcher(&searcher))
+        .context("build streaming query weight")?;
+
+    let mut emitted = 0usize;
+    for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
+        let mut scorer = weight.scorer(segment_reader, 1.0)?;
+        let mut doc = scorer.doc();
+        while doc != TERMINATED {
+            emitted += 1;
+            let doc_address = DocAddress::new(segment_ord as u32, doc);
+            let hit_doc: TantivyDocument = searcher.doc(doc_address).context("load streamed document")?;
+            on_hit(SearchHit {
+                rank: emitted,
+                score: scorer.score(),
+                id: doc_first_text(&hit_doc, fields.id),
+                kind: doc_first_text(&hit_doc, fields.kind),
+                year_month: year_month.map(ToOwned::to_owned),
+                subreddit: doc_first_text(&hit_doc, fields.subreddit),
+                author: doc_first_text(&hit_doc, fields.author),
+                created_at: doc_first_i64(&hit_doc, fields.created_at),
+                title: doc_first_text(&hit_doc, fields.title),
+                body: doc_first_text(&hit_doc, fields.body),
+            })?;
+            doc = scorer.advance();
+        }
+    }
+
+    Ok(emitted)
 }
 
 pub fn truncate(text: &str, max_chars: usize) -> String {
