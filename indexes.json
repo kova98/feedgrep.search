@@ -1,0 +1,34 @@
+{
+  "indexes": [
+    {
+      "kind": "comment",
+      "yearMonth": "2025-12",
+      "path": "/home/roko/reddit-indexes/feedgrep-comments-index-sample"
+    },
+    {
+      "kind": "comment",
+      "yearMonth": "2026-01",
+      "path": "/home/roko/reddit-indexes/feedgrep-comments-index-2026-01-partial-from-tmp"
+    },
+    {
+      "kind": "comment",
+      "yearMonth": "2026-02",
+      "path": "/home/roko/reddit-indexes/feedgrep-comments-index-2026-02-partial"
+    },
+    {
+      "kind": "post",
+      "yearMonth": "2025-12",
+      "path": "/home/roko/reddit-indexes/feedgrep-submissions-index-12"
+    },
+    {
+      "kind": "post",
+      "yearMonth": "2026-01",
+      "path": "/home/roko/reddit-indexes/feedgrep-submissions-index-01"
+    },
+    {
+      "kind": "post",
+      "yearMonth": "2026-02",
+      "path": "/home/roko/reddit-indexes/feedgrep-submissions-index-02"
+    }
+  ]
+}
