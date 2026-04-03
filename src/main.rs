@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Args, Parser, Subcommand};
+use dotenvy::dotenv;
 use feedgrep_search::{
     DiscoveredIndex, InputKind, build_schema, discover_indexes, discover_input_files, index_file,
     open_or_create_index, resolve_index_dir, resolve_kind, resolve_reddit_archive, search_index,
@@ -42,26 +43,29 @@ enum Command {
 
 #[derive(Args, Debug)]
 struct IndexArgs {
-    #[arg(long, conflicts_with = "index_root")]
+    #[arg(long, env = "FEEDGREP_INDEX_DIR", conflicts_with = "index_root")]
     index_dir: Option<PathBuf>,
 
-    #[arg(long, conflicts_with = "index_dir")]
+    #[arg(long, env = "FEEDGREP_INDEX_ROOT", conflicts_with = "index_dir")]
     index_root: Option<PathBuf>,
 
-    #[arg(long, value_enum)]
+    #[arg(long, env = "FEEDGREP_INPUT_KIND", value_enum)]
     kind: Option<InputKind>,
 
-    #[arg(long)]
+    #[arg(long, env = "FEEDGREP_REDDIT_ROOT")]
     reddit_root: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, env = "FEEDGREP_YEAR_MONTH")]
     year_month: Option<String>,
 
-    #[arg(long, default_value_t = 50_000_000)]
+    #[arg(long, env = "FEEDGREP_INDEXER_WRITER_MEMORY_BYTES", default_value_t = 250_000_000)]
     writer_memory_bytes: usize,
 
-    #[arg(long, default_value_t = 5_000)]
+    #[arg(long, env = "FEEDGREP_INDEXER_COMMIT_EVERY", default_value_t = 50_000)]
     commit_every: usize,
+
+    #[arg(long, env = "FEEDGREP_INDEXER_PROGRESS_EVERY", default_value_t = 100_000)]
+    progress_every: usize,
 
     #[arg()]
     inputs: Vec<PathBuf>,
@@ -69,19 +73,19 @@ struct IndexArgs {
 
 #[derive(Args, Debug)]
 struct SearchArgs {
-    #[arg(long)]
+    #[arg(long, env = "FEEDGREP_INDEX_DIR")]
     index_dir: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, env = "FEEDGREP_INDEX_ROOT")]
     index_root: Option<PathBuf>,
 
-    #[arg(long, value_enum)]
+    #[arg(long, env = "FEEDGREP_INPUT_KIND", value_enum)]
     kind: Option<InputKind>,
 
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, env = "FEEDGREP_SEARCH_LIMIT", default_value_t = 10)]
     limit: usize,
 
-    #[arg(long)]
+    #[arg(long, env = "FEEDGREP_SEARCH_MIN_SCORE")]
     min_score: Option<f32>,
 
     query: String,
@@ -89,10 +93,10 @@ struct SearchArgs {
 
 #[derive(Args, Debug)]
 struct ServeArgs {
-    #[arg(long, default_value = "127.0.0.1:4001")]
+    #[arg(long, env = "FEEDGREP_LISTEN_ADDR", default_value = "127.0.0.1:4001")]
     listen_addr: SocketAddr,
 
-    #[arg(long, default_value = "./tantivy-indexes")]
+    #[arg(long, env = "FEEDGREP_INDEX_ROOT", default_value = "./tantivy-indexes")]
     index_root: PathBuf,
 }
 
@@ -139,6 +143,7 @@ struct ApiError(anyhow::Error);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = dotenv();
     let cli = Cli::parse();
     match cli.command {
         Command::Index(args) => run_index(args),
@@ -168,8 +173,27 @@ fn run_index(args: IndexArgs) -> Result<()> {
             .writer(args.writer_memory_bytes)
             .context("create tantivy writer")?;
 
-        let indexed_docs = index_file(&file, kind, &fields, &mut writer, args.commit_every)
-            .with_context(|| format!("index file {}", file.display()))?;
+        let indexed_docs = index_file(
+            &file,
+            kind,
+            &fields,
+            &mut writer,
+            args.commit_every,
+            args.progress_every,
+            |progress| {
+                println!(
+                    "progress file={} kind={} indexed_docs={} compressed_pct={:.1}% compressed_mb={:.1}/{:.1} docs_per_sec={:.0}",
+                    file.display(),
+                    kind.as_str(),
+                    progress.indexed_docs,
+                    progress_percent(&progress),
+                    progress.compressed_bytes_read as f64 / 1_000_000.0,
+                    progress.compressed_bytes_total as f64 / 1_000_000.0,
+                    progress.docs_per_sec,
+                );
+            },
+        )
+        .with_context(|| format!("index file {}", file.display()))?;
         writer.commit().context("final commit")?;
 
         total_indexed_docs += indexed_docs;
@@ -419,6 +443,14 @@ fn index_matches_kind(entry: &DiscoveredIndex, kind: Option<InputKind>) -> bool 
 fn hit_matches_kind(hit: &feedgrep_search::SearchHit, kind: Option<InputKind>) -> bool {
     kind.is_none_or(|kind| hit.kind == kind.as_str())
 }
+
+fn progress_percent(progress: &feedgrep_search::IndexProgress) -> f64 {
+    if progress.compressed_bytes_total == 0 {
+        return 0.0;
+    }
+    (progress.compressed_bytes_read as f64 / progress.compressed_bytes_total as f64) * 100.0
+}
+
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {

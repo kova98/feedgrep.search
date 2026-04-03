@@ -1,6 +1,9 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
@@ -48,8 +51,13 @@ struct ArcticShiftComment {
 }
 
 #[derive(Debug, Deserialize)]
-struct DataEnvelope {
-    data: Vec<JsonValue>,
+struct DataEnvelopePost {
+    data: Vec<ArcticShiftPost>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataEnvelopeComment {
+    data: Vec<ArcticShiftComment>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +70,15 @@ pub struct Fields {
     pub title: tantivy::schema::Field,
     pub body: tantivy::schema::Field,
     pub combined_text: tantivy::schema::Field,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IndexProgress {
+    pub indexed_docs: usize,
+    pub compressed_bytes_read: u64,
+    pub compressed_bytes_total: u64,
+    pub elapsed_secs: f64,
+    pub docs_per_sec: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -256,18 +273,33 @@ pub fn resolve_index_dir(
     Ok(index_root.join(format!("{}-{}", kind.as_str(), base_name)))
 }
 
-pub fn index_file(
+pub fn index_file<F>(
     path: &Path,
     kind: InputKind,
     fields: &Fields,
     writer: &mut IndexWriter,
     commit_every: usize,
-) -> Result<usize> {
+    progress_every: usize,
+    mut on_progress: F,
+) -> Result<usize>
+where
+    F: FnMut(IndexProgress),
+{
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let decoder = Decoder::new(file).with_context(|| format!("open zstd decoder {}", path.display()))?;
-    let reader = BufReader::new(decoder);
+    let compressed_bytes_total = file
+        .metadata()
+        .with_context(|| format!("read metadata for {}", path.display()))?
+        .len();
+    let compressed_bytes_read = Arc::new(AtomicU64::new(0));
+    let counting_file = CountingReader::new(file, Arc::clone(&compressed_bytes_read));
+    let decoder = Decoder::new(counting_file)
+        .with_context(|| format!("open zstd decoder {}", path.display()))?;
+    let reader = BufReader::with_capacity(8 * 1024 * 1024, decoder);
 
     let mut count = 0usize;
+    let mut last_report_count = 0usize;
+    let started_at = Instant::now();
+
     for line in reader.lines() {
         let line = line?;
         let trimmed = line.trim();
@@ -275,56 +307,115 @@ pub fn index_file(
             continue;
         }
 
-        let value: JsonValue =
-            serde_json::from_str(trimmed).with_context(|| format!("parse json line in {}", path.display()))?;
+        count += match kind {
+            InputKind::Post => index_post_line(trimmed, fields, writer),
+            InputKind::Comment => index_comment_line(trimmed, fields, writer),
+        }
+        .with_context(|| format!("index json line in {}", path.display()))?;
 
-        count += index_value(value, kind, fields, writer)?;
         if count > 0 && count % commit_every == 0 {
             writer.commit().context("intermediate commit")?;
-            println!("file={} indexed_docs={count}", path.display());
         }
+
+        if progress_every > 0 && count.saturating_sub(last_report_count) >= progress_every {
+            on_progress(IndexProgress {
+                indexed_docs: count,
+                compressed_bytes_read: compressed_bytes_read.load(Ordering::Relaxed),
+                compressed_bytes_total,
+                elapsed_secs: started_at.elapsed().as_secs_f64(),
+                docs_per_sec: docs_per_sec(count, started_at.elapsed().as_secs_f64()),
+            });
+            last_report_count = count;
+        }
+    }
+
+    if count > 0 && count != last_report_count {
+        on_progress(IndexProgress {
+            indexed_docs: count,
+            compressed_bytes_read: compressed_bytes_read.load(Ordering::Relaxed),
+            compressed_bytes_total,
+            elapsed_secs: started_at.elapsed().as_secs_f64(),
+            docs_per_sec: docs_per_sec(count, started_at.elapsed().as_secs_f64()),
+        });
     }
 
     Ok(count)
 }
 
-fn index_value(value: JsonValue, kind: InputKind, fields: &Fields, writer: &mut IndexWriter) -> Result<usize> {
+fn index_post_line(line: &str, fields: &Fields, writer: &mut IndexWriter) -> Result<usize> {
+    if let Ok(post) = serde_json::from_str::<ArcticShiftPost>(line) {
+        writer.add_document(build_post_doc(post, fields))?;
+        return Ok(1);
+    }
+
+    let value: JsonValue = serde_json::from_str(line).context("parse post json")?;
     match value {
         JsonValue::Object(obj) if obj.contains_key("data") => {
-            let envelope: DataEnvelope =
-                serde_json::from_value(JsonValue::Object(obj)).context("decode data envelope")?;
+            let envelope: DataEnvelopePost =
+                serde_json::from_value(JsonValue::Object(obj)).context("decode post data envelope")?;
             let mut count = 0usize;
-            for item in envelope.data {
-                count += index_record(item, kind, fields, writer)?;
+            for post in envelope.data {
+                writer.add_document(build_post_doc(post, fields))?;
+                count += 1;
             }
             Ok(count)
         }
         JsonValue::Array(items) => {
+            let posts: Vec<ArcticShiftPost> =
+                serde_json::from_value(JsonValue::Array(items)).context("decode post array")?;
             let mut count = 0usize;
-            for item in items {
-                count += index_record(item, kind, fields, writer)?;
+            for post in posts {
+                writer.add_document(build_post_doc(post, fields))?;
+                count += 1;
             }
             Ok(count)
         }
-        other => index_record(other, kind, fields, writer),
+        JsonValue::Object(obj) => {
+            let post: ArcticShiftPost =
+                serde_json::from_value(JsonValue::Object(obj)).context("decode post")?;
+            writer.add_document(build_post_doc(post, fields))?;
+            Ok(1)
+        }
+        _ => bail!("unsupported post json shape"),
     }
 }
 
-fn index_record(value: JsonValue, kind: InputKind, fields: &Fields, writer: &mut IndexWriter) -> Result<usize> {
-    let document = match kind {
-        InputKind::Post => {
-            let post: ArcticShiftPost = serde_json::from_value(value).context("decode post")?;
-            build_post_doc(post, fields)
-        }
-        InputKind::Comment => {
-            let comment: ArcticShiftComment =
-                serde_json::from_value(value).context("decode comment")?;
-            build_comment_doc(comment, fields)
-        }
-    };
+fn index_comment_line(line: &str, fields: &Fields, writer: &mut IndexWriter) -> Result<usize> {
+    if let Ok(comment) = serde_json::from_str::<ArcticShiftComment>(line) {
+        writer.add_document(build_comment_doc(comment, fields))?;
+        return Ok(1);
+    }
 
-    writer.add_document(document)?;
-    Ok(1)
+    let value: JsonValue = serde_json::from_str(line).context("parse comment json")?;
+    match value {
+        JsonValue::Object(obj) if obj.contains_key("data") => {
+            let envelope: DataEnvelopeComment = serde_json::from_value(JsonValue::Object(obj))
+                .context("decode comment data envelope")?;
+            let mut count = 0usize;
+            for comment in envelope.data {
+                writer.add_document(build_comment_doc(comment, fields))?;
+                count += 1;
+            }
+            Ok(count)
+        }
+        JsonValue::Array(items) => {
+            let comments: Vec<ArcticShiftComment> =
+                serde_json::from_value(JsonValue::Array(items)).context("decode comment array")?;
+            let mut count = 0usize;
+            for comment in comments {
+                writer.add_document(build_comment_doc(comment, fields))?;
+                count += 1;
+            }
+            Ok(count)
+        }
+        JsonValue::Object(obj) => {
+            let comment: ArcticShiftComment =
+                serde_json::from_value(JsonValue::Object(obj)).context("decode comment")?;
+            writer.add_document(build_comment_doc(comment, fields))?;
+            Ok(1)
+        }
+        _ => bail!("unsupported comment json shape"),
+    }
 }
 
 fn build_post_doc(post: ArcticShiftPost, fields: &Fields) -> TantivyDocument {
@@ -372,6 +463,32 @@ fn normalize_text(title: &str, body: &str) -> String {
         out.push_str(body.trim());
     }
     out
+}
+
+fn docs_per_sec(count: usize, elapsed_secs: f64) -> f64 {
+    if elapsed_secs <= 0.0 {
+        return count as f64;
+    }
+    count as f64 / elapsed_secs
+}
+
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: Arc<AtomicU64>,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R, bytes_read: Arc<AtomicU64>) -> Self {
+        Self { inner, bytes_read }
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
+        Ok(read)
+    }
 }
 
 pub fn search_index(
